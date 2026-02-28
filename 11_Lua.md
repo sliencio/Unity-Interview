@@ -12,6 +12,7 @@
 > - xLua和ToLua的区别是什么？
 > - Lua性能优化有哪些方法？
 > - Lua如何调试？
+> - Lua和C#交互怎么减少GC？
 
 ---
 
@@ -583,7 +584,448 @@ rb.mass = 10
 
 ---
 
-## 11.7 Lua GC机制
+## 11.7 Lua与C#交互的GC优化
+
+### GC产生的原因
+
+```
+Lua与C#交互时GC产生的主要来源：
+
+┌─────────────────────────────────────────────────────────────┐
+│                    GC产生的场景                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 值类型装箱（Boxing）                                     │
+│     ┌─────────────────────────────────────────────────┐     │
+│     │ Lua传递int/float/bool到C# → 装箱为object        │     │
+│     │ C#返回值类型到Lua → 装箱                         │     │
+│     └─────────────────────────────────────────────────┘     │
+│                                                             │
+│  2. 字符串转换                                               │
+│     ┌─────────────────────────────────────────────────┐     │
+│     │ Lua string ↔ C# string 每次都创建新对象          │     │
+│     └─────────────────────────────────────────────────┘     │
+│                                                             │
+│  3. 委托/闭包创建                                            │
+│     ┌─────────────────────────────────────────────────┐     │
+│     │ 每次传递Lua函数到C#都创建新的委托对象             │     │
+│     └─────────────────────────────────────────────────┘     │
+│                                                             │
+│  4. 数组/表转换                                              │
+│     ┌─────────────────────────────────────────────────┐     │
+│     │ Lua table ↔ C# array/List 需要创建新集合         │     │
+│     └─────────────────────────────────────────────────┘     │
+│                                                             │
+│  5. 参数传递                                                 │
+│     ┌─────────────────────────────────────────────────┐     │
+│     │ 可变参数(params)会创建数组                        │     │
+│     │ 多返回值需要创建临时对象                          │     │
+│     └─────────────────────────────────────────────────┘     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 优化策略1：避免频繁的跨语言调用
+
+```csharp
+// ❌ 不好：每帧多次跨语言调用
+public class BadExample : MonoBehaviour
+{
+    private LuaFunction luaUpdate;
+    
+    void Update()
+    {
+        // 每帧调用多次Lua函数，每次都有GC开销
+        luaUpdate.Call(transform.position.x);  // GC
+        luaUpdate.Call(transform.position.y);  // GC
+        luaUpdate.Call(transform.position.z);  // GC
+    }
+}
+
+// ✅ 好：批量传递数据，减少调用次数
+public class GoodExample : MonoBehaviour
+{
+    private LuaFunction luaUpdate;
+    private float[] positionArray = new float[3];  // 复用数组
+    
+    void Update()
+    {
+        // 一次调用传递所有数据
+        positionArray[0] = transform.position.x;
+        positionArray[1] = transform.position.y;
+        positionArray[2] = transform.position.z;
+        luaUpdate.Call(positionArray);  // 只有一次GC
+    }
+}
+```
+
+### 优化策略2：缓存委托和LuaFunction
+
+```csharp
+// ❌ 不好：每次都获取Lua函数
+public class BadDelegate : MonoBehaviour
+{
+    private LuaEnv luaEnv;
+    
+    void Update()
+    {
+        // 每帧都创建新的委托对象
+        var func = luaEnv.Global.Get<Action<int>>("OnUpdate");
+        func(Time.frameCount);
+    }
+}
+
+// ✅ 好：缓存委托
+public class GoodDelegate : MonoBehaviour
+{
+    private LuaEnv luaEnv;
+    private Action<int> cachedOnUpdate;  // 缓存委托
+    
+    void Start()
+    {
+        // 只获取一次
+        cachedOnUpdate = luaEnv.Global.Get<Action<int>>("OnUpdate");
+    }
+    
+    void Update()
+    {
+        cachedOnUpdate?.Invoke(Time.frameCount);  // 无GC
+    }
+    
+    void OnDestroy()
+    {
+        cachedOnUpdate = null;  // 释放引用
+    }
+}
+```
+
+### 优化策略3：使用struct代替class传递数据
+
+```csharp
+// ❌ 不好：使用class传递数据
+[LuaCallCSharp]
+public class PlayerData  // class会在堆上分配
+{
+    public float x, y, z;
+    public int hp;
+}
+
+// ✅ 好：使用struct（需要xLua的GCOptimize特性）
+[LuaCallCSharp]
+[GCOptimize]  // xLua特性，优化struct的传递
+public struct PlayerDataStruct
+{
+    public float x, y, z;
+    public int hp;
+}
+
+// 在xLua中配置
+public static class XLuaConfig
+{
+    [GCOptimize]
+    public static List<Type> GCOptimizeList = new List<Type>
+    {
+        typeof(Vector3),
+        typeof(Vector2),
+        typeof(Quaternion),
+        typeof(Color),
+        typeof(PlayerDataStruct),
+    };
+}
+```
+
+### 优化策略4：避免字符串频繁转换
+
+```lua
+-- ❌ 不好：频繁传递字符串
+function Update()
+    -- 每帧都创建新字符串
+    CS.Debug.Log("Player position: " .. tostring(x) .. ", " .. tostring(y))
+end
+
+-- ✅ 好：使用ID或枚举代替字符串
+local LogType = {
+    Position = 1,
+    Health = 2,
+    Damage = 3,
+}
+
+function Update()
+    -- 传递数字，无字符串GC
+    CS.GameLogger.Log(LogType.Position, x, y)
+end
+```
+
+```csharp
+// C#端使用枚举或ID
+[LuaCallCSharp]
+public static class GameLogger
+{
+    private static readonly string[] LogFormats = {
+        "",
+        "Position: {0}, {1}",
+        "Health: {0}",
+        "Damage: {0}",
+    };
+    
+    public static void Log(int type, params object[] args)
+    {
+        // 使用预定义格式，减少字符串创建
+        Debug.LogFormat(LogFormats[type], args);
+    }
+}
+```
+
+### 优化策略5：使用对象池
+
+```csharp
+// C#端对象池
+[LuaCallCSharp]
+public class LuaObjectPool<T> where T : class, new()
+{
+    private static Stack<T> pool = new Stack<T>();
+    
+    public static T Get()
+    {
+        return pool.Count > 0 ? pool.Pop() : new T();
+    }
+    
+    public static void Return(T obj)
+    {
+        pool.Push(obj);
+    }
+}
+```
+
+```lua
+-- Lua端使用对象池
+local Vector3Pool = {}
+local poolSize = 0
+
+function Vector3Pool.Get()
+    if poolSize > 0 then
+        poolSize = poolSize - 1
+        return table.remove(Vector3Pool, poolSize + 1)
+    end
+    return {x = 0, y = 0, z = 0}
+end
+
+function Vector3Pool.Return(v)
+    v.x, v.y, v.z = 0, 0, 0
+    poolSize = poolSize + 1
+    Vector3Pool[poolSize] = v
+end
+
+-- 使用
+local pos = Vector3Pool.Get()
+pos.x, pos.y, pos.z = 1, 2, 3
+-- 使用完毕
+Vector3Pool.Return(pos)
+```
+
+### 优化策略6：减少返回值数量
+
+```csharp
+// ❌ 不好：多返回值会创建临时对象
+[LuaCallCSharp]
+public class BadReturn
+{
+    public static (int, int, int) GetPosition()  // 元组会装箱
+    {
+        return (1, 2, 3);
+    }
+}
+
+// ✅ 好：使用out参数或传入引用
+[LuaCallCSharp]
+public class GoodReturn
+{
+    // 方法1：使用数组（预分配）
+    private static int[] resultArray = new int[3];
+    
+    public static int[] GetPosition()
+    {
+        resultArray[0] = 1;
+        resultArray[1] = 2;
+        resultArray[2] = 3;
+        return resultArray;  // 复用数组
+    }
+    
+    // 方法2：传入Lua table填充
+    public static void FillPosition(LuaTable table)
+    {
+        table.Set("x", 1);
+        table.Set("y", 2);
+        table.Set("z", 3);
+    }
+}
+```
+
+### 优化策略7：使用LuaTable代替Dictionary
+
+```csharp
+// ❌ 不好：每次转换都创建新Dictionary
+public void ProcessData(Dictionary<string, object> data)
+{
+    // Dictionary创建有GC
+}
+
+// ✅ 好：直接使用LuaTable
+public void ProcessData(LuaTable data)
+{
+    // 直接操作Lua表，无需转换
+    int value = data.Get<int>("key");
+}
+```
+
+### 优化策略8：xLua的GCOptimize配置
+
+```csharp
+// xLua配置文件
+public static class XLuaGenConfig
+{
+    // 需要GC优化的值类型
+    [GCOptimize]
+    public static List<Type> GCOptimizeList = new List<Type>
+    {
+        // Unity常用值类型
+        typeof(Vector2),
+        typeof(Vector3),
+        typeof(Vector4),
+        typeof(Quaternion),
+        typeof(Color),
+        typeof(Color32),
+        typeof(Rect),
+        typeof(Bounds),
+        typeof(Ray),
+        typeof(RaycastHit),
+        
+        // 自定义值类型
+        typeof(MyCustomStruct),
+    };
+    
+    // 需要适配的委托类型
+    [CSharpCallLua]
+    public static List<Type> CSharpCallLuaList = new List<Type>
+    {
+        typeof(Action),
+        typeof(Action<int>),
+        typeof(Action<float>),
+        typeof(Action<string>),
+        typeof(Func<int>),
+        typeof(Func<float>),
+        // 预定义常用委托，避免运行时生成
+    };
+}
+```
+
+### 优化策略9：避免在热点代码中跨语言
+
+```lua
+-- ❌ 不好：在Update中频繁调用C#
+function Update()
+    local pos = CS.UnityEngine.Input.mousePosition  -- 每帧GC
+    local ray = CS.UnityEngine.Camera.main:ScreenPointToRay(pos)  -- 每帧GC
+end
+
+-- ✅ 好：在C#中处理热点逻辑，只传递结果
+-- C#端
+[LuaCallCSharp]
+public class InputHelper
+{
+    private static Vector3 mouseWorldPos;
+    
+    public static void UpdateMousePosition()
+    {
+        // 在C#中计算，避免跨语言
+        var ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+        if (Physics.Raycast(ray, out var hit))
+        {
+            mouseWorldPos = hit.point;
+        }
+    }
+    
+    public static float MouseX => mouseWorldPos.x;
+    public static float MouseY => mouseWorldPos.y;
+    public static float MouseZ => mouseWorldPos.z;
+}
+
+-- Lua端
+function Update()
+    CS.InputHelper.UpdateMousePosition()  -- 一次调用
+    local x = CS.InputHelper.MouseX  -- 简单属性访问，GC很小
+    local y = CS.InputHelper.MouseY
+end
+```
+
+### 优化策略10：使用静态方法代替实例方法
+
+```csharp
+// ❌ 不好：实例方法需要传递this
+[LuaCallCSharp]
+public class Calculator
+{
+    public int Add(int a, int b) => a + b;
+}
+
+// Lua中：
+// local calc = CS.Calculator()  -- 创建实例，有GC
+// calc:Add(1, 2)
+
+// ✅ 好：使用静态方法
+[LuaCallCSharp]
+public static class Calculator
+{
+    public static int Add(int a, int b) => a + b;
+}
+
+// Lua中：
+// CS.Calculator.Add(1, 2)  -- 无需创建实例
+```
+
+### GC优化检测工具
+
+```csharp
+// 简单的GC监控
+public class GCMonitor : MonoBehaviour
+{
+    private int lastGCCount;
+    private float checkInterval = 1f;
+    private float timer;
+    
+    void Update()
+    {
+        timer += Time.deltaTime;
+        if (timer >= checkInterval)
+        {
+            timer = 0;
+            int currentGC = GC.CollectionCount(0);
+            if (currentGC > lastGCCount)
+            {
+                Debug.LogWarning($"GC发生了 {currentGC - lastGCCount} 次");
+            }
+            lastGCCount = currentGC;
+        }
+    }
+}
+```
+
+### GC优化总结表
+
+| 优化策略 | 效果 | 实现难度 |
+|----------|------|----------|
+| 缓存委托/LuaFunction | ⭐⭐⭐⭐⭐ | 低 |
+| 减少跨语言调用次数 | ⭐⭐⭐⭐⭐ | 中 |
+| 使用GCOptimize特性 | ⭐⭐⭐⭐ | 低 |
+| 对象池 | ⭐⭐⭐⭐ | 中 |
+| 避免字符串转换 | ⭐⭐⭐ | 中 |
+| 使用静态方法 | ⭐⭐⭐ | 低 |
+| 批量传递数据 | ⭐⭐⭐ | 中 |
+| 热点代码放C#端 | ⭐⭐⭐⭐⭐ | 高 |
+
+---
+
+## 11.8 Lua GC机制
 
 ### GC原理
 
@@ -676,7 +1118,7 @@ local str = table.concat(t)
 
 ---
 
-## 11.8 Lua协程
+## 11.9 Lua协程
 
 ### 基本使用
 
@@ -750,7 +1192,7 @@ end
 
 ---
 
-## 11.9 xLua vs ToLua
+## 11.10 xLua vs ToLua
 
 ### 对比
 
@@ -792,7 +1234,7 @@ end)
 
 ---
 
-## 11.10 Lua性能优化
+## 11.11 Lua性能优化
 
 ### 优化技巧
 
@@ -839,7 +1281,7 @@ local t = {0,0,0,0,0,0,0,0,0,0}  -- 预分配
 
 ---
 
-## 11.11 Lua调试
+## 11.12 Lua调试
 
 ### 调试方法
 
@@ -952,6 +1394,43 @@ print(info.name, info.source, info.currentline)
 - pcall错误处理
 - debug.traceback调用栈
 - IDE调试器（ZeroBrane、VSCode）
+
+### 问题71：Lua和C#交互怎么减少GC？
+
+**答案要点：**
+
+1. **GC产生的主要原因**：
+   - 值类型装箱（int/float/bool传递）
+   - 字符串转换
+   - 委托/闭包创建
+   - 数组/表转换
+   - 可变参数
+
+2. **核心优化策略**：
+   - **缓存委托**：Start时获取，避免每帧创建
+   - **减少调用次数**：批量传递数据
+   - **GCOptimize特性**：优化Vector3等值类型传递
+   - **对象池**：复用Lua table和C#对象
+   - **避免字符串**：使用ID/枚举代替
+   - **静态方法**：避免创建实例
+   - **热点代码放C#**：减少跨语言调用
+
+3. **xLua配置**：
+   ```csharp
+   [GCOptimize]
+   public static List<Type> GCOptimizeList = new List<Type>
+   {
+       typeof(Vector3),
+       typeof(Quaternion),
+       // 自定义struct
+   };
+   ```
+
+4. **最佳实践**：
+   - Update中避免跨语言调用
+   - 预分配数组复用
+   - 使用LuaTable代替Dictionary
+   - 监控GC频率定位问题
 
 ---
 
